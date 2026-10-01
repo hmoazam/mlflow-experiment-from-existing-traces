@@ -8,6 +8,12 @@ Works for any UC span table: MLflow-created "raw" traces, the redacted output of
 (e.g. [otel-pii-redaction](https://github.com/hmoazam/otel-pii-redaction)), or traces an
 external / non-Databricks app exported into UC.
 
+**Scope.** This repo starts from the point where **OTel span data already exists in a Unity
+Catalog Delta table**. Getting it there — instrumenting an app, OTLP ingest, an ETL job, or a
+redaction pipeline — is upstream and **out of scope**; those are named only as example origins.
+The source must be **span-shaped** (one row per span, with `trace_id` / `span_id` / `attributes`)
+and live in **UC** — a UC Delta table is the only thing MLflow's trace backend can adopt.
+
 ## The catch (and the fix)
 
 You **cannot** just name an existing table as an experiment's trace location. MLflow's backend
@@ -59,6 +65,37 @@ existing spans table                MLflow-owned, adopted tables (target schema)
                                           ▲ experiment bound here (V4 API)
 ```
 
+## Adopting external / non-MLflow traces
+
+The reshape (Step 3) adapts **any column layout** — missing columns are defaulted and
+`attributes` is coerced to `MAP<STRING,STRING>` whether the source stored it as VARIANT, a JSON
+string, or an existing map. So a span table exported into UC by a non-MLflow app binds and lists
+fine, regardless of its schema.
+
+Whether the **request / response** columns populate in the Traces UI depends on the span's
+**attribute keys**, not on how the table was produced. MLflow's `_unified` view derives them by
+`COALESCE`-ing over a fixed set of recognized conventions:
+
+| Column | Recognized attribute keys (first non-null wins) |
+|---|---|
+| `request`  | `mlflow.spanInputs` · `input.value` (OpenInference) · `gen_ai.input.messages` · `gen_ai.tool.call.arguments` · `gcp.vertex.agent.llm_request` |
+| `response` | `mlflow.spanOutputs` · `output.value` · `gen_ai.output.messages` · `gen_ai.tool.call.result` · `gcp.vertex.agent.llm_response` · `gcp.vertex.agent.tool_response` |
+
+If your source uses one of these (MLflow, OpenInference, OTel-GenAI, Vertex), request/response
+render with no extra work — validated against an external OpenInference-convention table. If it
+uses **custom keys** (e.g. `prompt_text` / `reply_text`), the spans still appear but
+request/response come up empty; alias the custom key to a recognized one in the Step 3 reshape,
+e.g.:
+
+```sql
+-- surface custom keys under names MLflow recognizes (later keys win in map_concat)
+map_concat(
+  from_json(CAST(s.attributes AS STRING), 'MAP<STRING,STRING>'),
+  map('mlflow.spanInputs',  get_json_object(CAST(s.attributes AS STRING), '$.prompt_text'),
+      'mlflow.spanOutputs', get_json_object(CAST(s.attributes AS STRING), '$.reply_text'))
+) AS attributes
+```
+
 ## Files
 
 | File | Purpose |
@@ -69,10 +106,16 @@ existing spans table                MLflow-owned, adopted tables (target schema)
 
 ## Caveats
 
-- **It's a copy, not a live view.** MLflow must own the physical tables, so traces are
-  duplicated into the target. The notebook uses `INSERT OVERWRITE`, so re-running refreshes;
-  schedule it if the source keeps growing. Binding an experiment to a plain view/MV over the
-  source is not possible.
+- **The default is a physical copy.** The notebook copies the reshaped spans into the target via
+  `INSERT OVERWRITE` (re-run or schedule it as the source grows). This is the recommended path —
+  the experiment stays writable and is decoupled from the source's lifecycle.
+  - A **materialized view** named `mlflow_experiment_trace_otel_spans` **can** be adopted instead
+    (no data copy), but **read-only**: stamp `otel.schemaVersion=v1` *inline* in
+    `CREATE … TBLPROPERTIES(…) AS` (an MV rejects `ALTER … SET TBLPROPERTIES`), and any new traces
+    logged to the bound experiment are **silently dropped** (MLflow can't write to an MV). You
+    also own `REFRESH`. Use only for read-only adoption of existing traces.
+  - A **plain view** does **not** work — it can't carry the `otel.schemaVersion` table property,
+    so MLflow won't adopt it.
 - **Binding is permanent** per experiment (unset with
   `mlflow.tracing.unset_experiment_trace_location(...)`, or use a new experiment name).
 - **events / links** default to empty arrays; preserving them needs a per-source
@@ -85,6 +128,8 @@ existing spans table                MLflow-owned, adopted tables (target schema)
 
 ## Provenance
 
-Recipe validated in a Databricks workspace against real redacted trace tables. The critical
-unlock — `otel.schemaVersion` is a settable Delta table property — is what turns "you can't
-point an experiment at existing tables" into the flow above.
+Recipe validated end-to-end in a Databricks workspace against MLflow-generated, PII-redacted, and
+external (non-MLflow, OpenInference-convention) UC span tables, and with both a physical-table
+copy and a read-only materialized view. The critical unlock — `otel.schemaVersion` is a settable
+Delta table property — is what turns "you can't point an experiment at existing tables" into the
+flow above.
