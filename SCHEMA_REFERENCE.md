@@ -1,105 +1,101 @@
-# OTel span schema reference & reshape mapping
+# OTel span schema reference & conversion mapping
 
-The MLflow trace backend accepts only tables that match its OTel span schema **and** carry the
-Delta table property `otel.schemaVersion = v1`. This file documents that target schema (as
-created by MLflow 3.14 via `mlflow.tracing.set_experiment_trace_location`) and how to reshape a
-source span table into it.
+Databricks defines two UC trace-table schema versions, selected by the Delta table property
+`otel.schemaVersion`. This repo always targets **v2** (the current schema). This file documents both
+and how the notebook converts a source into v2.
 
-> The notebook reads this schema from your workspace at runtime (Step 2), so it always matches
-> your MLflow version. This file is for understanding and manual adaptation.
+## v2 — the target schema (`{prefix}_otel_spans`)
 
-## Target: `mlflow_experiment_trace_otel_spans` (20 columns)
+Current schema (Zerobus OTLP ingestion and MLflow's `set_experiment(trace_location=UnityCatalog(...))`
+produce it). `attributes` and all nested attribute fields are **`VARIANT`**; four Databricks-specific
+columns lead the table.
 
 ```sql
-CREATE TABLE mlflow_experiment_trace_otel_spans (
-  trace_id                  STRING,
-  span_id                   STRING,
-  trace_state               STRING,
-  parent_span_id            STRING,
-  flags                     INT,
-  name                      STRING,
-  kind                      STRING,
-  start_time_unix_nano      BIGINT,
-  end_time_unix_nano        BIGINT,
-  attributes                MAP<STRING, STRING>,
-  dropped_attributes_count  INT,
-  events                    ARRAY<STRUCT<time_unix_nano: BIGINT, name: STRING,
-                                         attributes: MAP<STRING, STRING>,
-                                         dropped_attributes_count: INT>>,
-  dropped_events_count      INT,
-  links                     ARRAY<STRUCT<trace_id: STRING, span_id: STRING, trace_state: STRING,
-                                         attributes: MAP<STRING, STRING>,
-                                         dropped_attributes_count: INT, flags: INT>>,
-  dropped_links_count       INT,
-  status                    STRUCT<message: STRING, code: STRING>,
-  resource                  STRUCT<attributes: MAP<STRING, STRING>, dropped_attributes_count: INT>,
-  resource_schema_url       STRING,
-  instrumentation_scope     STRUCT<name: STRING, version: STRING,
-                                   attributes: MAP<STRING, STRING>, dropped_attributes_count: INT>,
-  span_schema_url           STRING
-) USING delta
-TBLPROPERTIES ('otel.schemaVersion' = 'v1');
+CREATE TABLE {prefix}_otel_spans (
+  record_id STRING, time TIMESTAMP, date DATE, service_name STRING,   -- v2-only, synthesized
+  trace_id STRING, span_id STRING, trace_state STRING, parent_span_id STRING,
+  flags INT, name STRING, kind STRING,
+  start_time_unix_nano BIGINT, end_time_unix_nano BIGINT,
+  attributes VARIANT, dropped_attributes_count INT,
+  events ARRAY<STRUCT<time_unix_nano:BIGINT, name:STRING, attributes:VARIANT, dropped_attributes_count:INT>>,
+  dropped_events_count INT,
+  links ARRAY<STRUCT<trace_id:STRING, span_id:STRING, trace_state:STRING, attributes:VARIANT, dropped_attributes_count:INT, flags:INT>>,
+  dropped_links_count INT,
+  status STRUCT<message:STRING, code:STRING>,
+  resource STRUCT<attributes:VARIANT, dropped_attributes_count:INT>,
+  resource_schema_url STRING,
+  instrumentation_scope STRUCT<name:STRING, version:STRING, attributes:VARIANT, dropped_attributes_count:INT>,
+  span_schema_url STRING
+) USING DELTA CLUSTER BY (time, service_name, trace_id)
+TBLPROPERTIES ('otel.schemaVersion' = 'v2');
 ```
 
-MLflow also expects (and, on binding, creates) `mlflow_experiment_trace_otel_logs` and
-`mlflow_experiment_trace_otel_metrics` physical tables, plus `mlflow_experiment_trace_metadata`
-and `mlflow_experiment_trace_unified` **views**. Create the three tables; let MLflow build the
-two views.
+MLflow also expects `{prefix}_otel_logs` and `{prefix}_otel_metrics` tables and, on binding, creates
+`{prefix}_otel_annotations` plus the `{prefix}_trace_metadata` and `{prefix}_trace_unified` **views**.
+Don't pre-create the views.
 
-## Two different MLflow trace schemas — pick the right one
+> The notebook doesn't hardcode this DDL — it calls `set_experiment(trace_location=UnityCatalog(...))`,
+> which creates the empty v2 tables for your MLflow version, then populates them. Read column names
+> with `DESCRIBE TABLE` (not `spark.table(...).schema`, which can't resolve `VARIANT` over Spark
+> Connect), and stop at the clustering/metadata boundary so `CLUSTER BY` columns aren't double-counted.
 
-| | `set_experiment(trace_location=UnityCatalog(...))` (V5) | `set_experiment_trace_location(UCSchemaLocation(...))` (V4) |
+## v1 — the legacy schema (`mlflow_experiment_trace_otel_spans`)
+
+Older schema from `mlflow.tracing.set_experiment_trace_location`. Same columns as v2 **minus**
+`record_id/time/date/service_name`, with `attributes` (and nested attrs) as **`MAP<STRING,STRING>`**,
+and no annotations table (tags/assessments/metadata live as events in `_otel_logs`).
+
+## Which API, which version
+
+| | `set_experiment(trace_location=UnityCatalog(cat,schema,prefix))` | `set_experiment_trace_location(UCSchemaLocation(cat,schema))` |
 |---|---|---|
-| Table names | `{prefix}_otel_spans` | `mlflow_experiment_trace_otel_spans` (or custom via `_otel_spans_table_name`) |
-| `attributes` type | `VARIANT` | **`MAP<STRING,STRING>`** |
-| Extra columns | `record_id`, `time`, `date`, `service_name` | none |
-| Adopts pre-existing tables? | **No** — fails "Telemetry profile not found" even when stamped | **Yes** — with `otel.schemaVersion=v1` |
+| Schema | **v2** (VARIANT, `{prefix}_otel_*`) | v1 (MAP, `mlflow_experiment_trace_otel_*`) |
+| Adopts a pre-existing **table** set? | **Yes** — conformant v2 tables are adopted in place | Yes — v1 tables |
+| Adopts a **materialized view**? | **No** — rejected (`Failed to validate table compatibility`) | (v1 path; not used here) |
 
-**Use the V4 path.** It is the only one that adopts existing tables. The reshape below targets
-the V4 MAP schema.
+Use the v2 creation API. It adopts an existing conformant v2 table set *and* creates a new one when
+absent — validated against pre-existing Zerobus-style tables.
 
-## Reshape mapping (source → V4 target)
+## Converting a source into v2
 
-For a source in the MLflow "raw" shape or a PII-redaction output (VARIANT/JSON attributes):
+### Standard v1 → v2: the official migrator
+
+For a standard v1 table set (`mlflow_experiment_trace_otel_spans` + `_otel_logs`), use the supported
+helper (`databricks-agents >= 1.10.1`), which does MAP→VARIANT, adds the four v2 columns, and
+converts log-events → annotations:
+
+```python
+from databricks.migrations.v1_to_v2 import V1ToV2SqlMigration
+V1ToV2SqlMigration(
+    v1_source_schema="<cat>.<schema>",                 # expects .mlflow_experiment_trace_otel_spans/_logs
+    v2_destination_prefix="<cat>.<schema>.<prefix>",   # the v2 tables created by set_experiment(...)
+).run()
+```
+
+A standard-v1 table under a **non-standard name** can still use it: expose it under the expected names
+via views in a scratch schema (no copy), then point the migrator at that schema —
+
+```sql
+CREATE VIEW scratch.mlflow_experiment_trace_otel_spans AS SELECT * FROM your.renamed_spans;
+CREATE VIEW scratch.mlflow_experiment_trace_otel_logs  AS SELECT * FROM your.renamed_logs;  -- empty-compatible if none
+```
+
+### Arbitrary source → v2: generic reshape
+
+For any other layout, map each v2 column from the source (defaulting missing ones) and convert
+attributes to VARIANT:
 
 | Target column | Source expression |
 |---|---|
-| scalar cols (`trace_id`, `span_id`, `flags`, timestamps, `name`, `kind`, `*_count`, `*_schema_url`, `trace_state`, `parent_span_id`) | pass through (`s.<col>`), default if absent |
-| `attributes` | `from_json(CAST(s.attributes AS STRING), 'MAP<STRING,STRING>')` |
-| `resource` | `named_struct('attributes', from_json(CAST(s.resource.attributes AS STRING),'MAP<STRING,STRING>'), 'dropped_attributes_count', s.resource.dropped_attributes_count)` |
-| `instrumentation_scope` | `named_struct('name', s.instrumentation_scope.name, 'version', s.instrumentation_scope.version, 'attributes', from_json(CAST(s.instrumentation_scope.attributes AS STRING),'MAP<STRING,STRING>'), 'dropped_attributes_count', s.instrumentation_scope.dropped_attributes_count)` |
-| `status` | `named_struct('message', s.status.message, 'code', s.status.code)` |
-| `events` | empty typed array by default; reconstruct if needed (see below) |
-| `links` | empty typed array by default; reconstruct if needed |
+| `record_id` / `time` / `date` / `service_name` | `uuid()` · `timestamp_micros(start_time_unix_nano/1000)` · `to_date(time)` · `resource.attributes['service.name']` |
+| `attributes` | `parse_json(s.attributes)` if JSON-string, else `parse_json(to_json(s.attributes))` (handles MAP / STRUCT / VARIANT) |
+| `resource` / `instrumentation_scope` | `named_struct('attributes', <attrs→VARIANT>, 'dropped_attributes_count', …)` |
+| `events` / `links` | `transform(...)` rebuilding each struct with nested `attributes` → VARIANT; else empty typed array |
+| scalar cols | pass through, default if absent |
 
-`CAST(... AS STRING)` before `from_json` works whether the source column is `VARIANT` or a JSON
-`STRING`. If the source is already `MAP<STRING,STRING>`, pass it through unchanged.
+## `{prefix}_trace_unified` (what the Traces UI reads)
 
-### Preserving events / links
-
-The default drops `events`/`links` to empty arrays because reconstructing `ARRAY<STRUCT<...>>`
-(whose nested `attributes` must also become `MAP<STRING,STRING>`) is source-specific. To
-preserve them, replace the empty-array expressions with a `transform(...)` that rebuilds each
-struct, converting the nested `attributes` to a map. Example sketch for events:
-
-```sql
-transform(
-  CAST(s.events AS ARRAY<STRUCT<time_unix_nano:BIGINT, name:STRING, attributes:STRING,
-                                dropped_attributes_count:INT>>),
-  e -> named_struct(
-         'time_unix_nano', e.time_unix_nano,
-         'name', e.name,
-         'attributes', from_json(e.attributes, 'MAP<STRING,STRING>'),
-         'dropped_attributes_count', e.dropped_attributes_count)
-) AS events
-```
-
-(The exact `CAST` target must match your source's events layout — inspect it with
-`DESCRIBE TABLE`.)
-
-## `mlflow_experiment_trace_unified` (what the Traces UI reads)
-
-The binding step creates this view over the spans/annotations. Its columns:
-`trace_id, client_request_id, request_time, state, execution_duration_ms, request, response,
-trace_metadata, tags, spans, assessments`. Querying it (`SELECT count(*)`) is a reliable,
-auth-independent way to confirm traces assemble correctly.
+Built on binding. `request` / `response` are derived by `COALESCE`-ing over recognized attribute
+keys (`mlflow.spanInputs/spanOutputs`, OpenInference `input.value`/`output.value`, OTel `gen_ai.*`,
+`gcp.vertex.*`). Querying `SELECT count(*)` on it is an auth-independent way to confirm traces
+assemble.

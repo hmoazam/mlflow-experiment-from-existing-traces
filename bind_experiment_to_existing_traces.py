@@ -1,40 +1,36 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Point an MLflow experiment at an existing trace table
+# MAGIC # Point an MLflow experiment at existing OTel traces (always lands on schema **v2**)
 # MAGIC
-# MAGIC Given an **existing** OTel span table in Unity Catalog — MLflow-created raw traces, the
-# MAGIC redacted output of a PII pipeline, or traces an external app exported into UC — this
-# MAGIC notebook makes those traces show up natively in an **MLflow experiment** (Traces UI,
-# MAGIC `mlflow.search_traces`, evaluation, etc.).
+# MAGIC Given OTel span data that **already exists in a Unity Catalog Delta table**, surface it in an
+# MAGIC **MLflow experiment** (Traces UI, `mlflow.search_traces`, evaluation). The table MLflow ends up
+# MAGIC bound to is always the current **`otel.schemaVersion = v2`** schema (VARIANT `attributes`,
+# MAGIC `{prefix}_otel_*` naming) — what Zerobus OTLP ingestion and MLflow's creation API produce.
 # MAGIC
-# MAGIC ### Why this is not a one-liner
+# MAGIC Databricks defines exactly two UC trace-table schema versions:
+# MAGIC **v1** (legacy, MAP attributes, fixed `mlflow_experiment_trace_otel_*` names) and
+# MAGIC **v2** (current, VARIANT attributes, `{prefix}_otel_*` names, dedicated annotations table).
+# MAGIC This notebook auto-detects your source and routes to the right handler:
 # MAGIC
-# MAGIC You **cannot** point an experiment at a pre-existing table just by naming it. MLflow's
-# MAGIC trace backend only accepts tables it recognizes as its own — it checks a Delta table
-# MAGIC property, `otel.schemaVersion`, and rejects anything stamped `UNSPECIFIED` with
-# MAGIC `ALREADY_EXISTS: ... expected v1, got UNSPECIFIED`. The trick that makes this work:
+# MAGIC | Detected source | Path | How it reaches v2 |
+# MAGIC |---|---|---|
+# MAGIC | **Conformant v2** (`otel.schemaVersion=v2`, VARIANT attrs, `{p}_otel_spans` + sibling logs/metrics) | **A — adopt in place** | `set_experiment(trace_location=UnityCatalog(...))` on the source schema. No copy. |
+# MAGIC | **Standard v1** (`mlflow_experiment_trace_otel_spans` + `_otel_logs`) | **B — official migrator** | Create a v2 destination, then `V1ToV2SqlMigration(...).run()` (MAP→VARIANT, log-events→annotations). |
+# MAGIC | **Anything else** (renamed v1, external exports, non-standard layouts) | **C — generic reshape** | Reshape into a fresh v2 table, then adopt it. |
 # MAGIC
-# MAGIC 1. **Reshape** your source into MLflow's exact OTel span schema (`attributes` as
-# MAGIC    `MAP<STRING,STRING>`, specific column names/order — see `SCHEMA_REFERENCE.md`).
-# MAGIC 2. **Stamp** `ALTER TABLE ... SET TBLPROPERTIES ('otel.schemaVersion' = 'v1')`.
-# MAGIC 3. **Bind** with `mlflow.tracing.set_experiment_trace_location(...)` — MLflow then
-# MAGIC    *adopts* your tables and builds its own `_metadata` / `_unified` views on top.
-# MAGIC
-# MAGIC > **Use the V4 API, not the creation-time one.** `set_experiment(trace_location=UnityCatalog(...))`
-# MAGIC > does **not** adopt pre-existing tables even when stamped (it fails server-side with
-# MAGIC > "Telemetry profile not found"). Only `mlflow.tracing.set_experiment_trace_location`
-# MAGIC > (shown here) adopts them.
+# MAGIC > **Why not a view / materialized view for the destination?** The v2 creation-time adoption
+# MAGIC > API validates the spans object is a physical table and **rejects a materialized view**
+# MAGIC > (`Failed to validate table compatibility`). So the convert paths (B, C) always land in a
+# MAGIC > physical table. Only an *already-v2 table set* can be adopted without a copy (Path A).
 # MAGIC
 # MAGIC ### Prerequisites
-# MAGIC - `mlflow[databricks] >= 3.14.0`
-# MAGIC - A serverless SQL warehouse ID
-# MAGIC - An existing OTel span table, and `MODIFY` + `SELECT` on the target schema
-# MAGIC - Run this **in the Databricks workspace** (in-workspace user creds; avoids a local-auth
-# MAGIC   quirk on the trace-read API — see the closing note)
+# MAGIC - `mlflow[databricks] >= 3.14.0`; `databricks-agents >= 1.10.1` (Path B only)
+# MAGIC - A serverless SQL warehouse ID; `MODIFY`+`SELECT`+`CREATE TABLE` on the target schema
+# MAGIC - Run **in the Databricks workspace**
 
 # COMMAND ----------
 
-# MAGIC %pip install "mlflow[databricks]>=3.14.0"
+# MAGIC %pip install "mlflow[databricks]>=3.14.0" "databricks-agents>=1.10.1"
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -44,15 +40,10 @@
 
 # COMMAND ----------
 
-# --- Source: the existing span table you want to surface ---
 dbutils.widgets.text("source_spans_table", "", "1. Source spans table (catalog.schema.table)")
-dbutils.widgets.text("source_logs_table", "", "2. Source logs table (optional, blank = none)")
-
-# --- Target: where MLflow's adopted tables will live ---
-dbutils.widgets.text("target_catalog", "", "3. Target catalog")
-dbutils.widgets.text("target_schema", "", "4. Target schema (created if absent)")
-
-# --- Experiment + compute ---
+dbutils.widgets.text("target_catalog", "", "2. Target catalog (convert paths B/C)")
+dbutils.widgets.text("target_schema", "", "3. Target schema (created if absent)")
+dbutils.widgets.text("target_table_prefix", "traces", "4. Target table prefix ({prefix}_otel_spans)")
 dbutils.widgets.text("experiment_name", "", "5. MLflow experiment name (/Users/you/name)")
 dbutils.widgets.text("sql_warehouse_id", "", "6. Serverless SQL warehouse ID")
 
@@ -61,9 +52,9 @@ dbutils.widgets.text("sql_warehouse_id", "", "6. Serverless SQL warehouse ID")
 import re
 
 source_spans_table = dbutils.widgets.get("source_spans_table").strip()
-source_logs_table = dbutils.widgets.get("source_logs_table").strip()
 target_catalog = dbutils.widgets.get("target_catalog").strip()
 target_schema = dbutils.widgets.get("target_schema").strip()
+target_prefix = dbutils.widgets.get("target_table_prefix").strip() or "traces"
 experiment_name = dbutils.widgets.get("experiment_name").strip()
 sql_warehouse_id = dbutils.widgets.get("sql_warehouse_id").strip()
 
@@ -77,245 +68,234 @@ def _fail(msg):
 
 if not _FQN.match(source_spans_table):
     _fail("Source spans table must be fully qualified: catalog.schema.table")
-if source_logs_table and not _FQN.match(source_logs_table):
-    _fail("Source logs table, if set, must be fully qualified: catalog.schema.table")
-for v, lbl in [(target_catalog, "Target catalog"), (target_schema, "Target schema")]:
-    if not _ID.match(v):
-        _fail(f"{lbl} must be a bare identifier")
 if not experiment_name:
     _fail("Experiment name is required")
 if not sql_warehouse_id:
     _fail("SQL warehouse ID is required")
 
-# MLflow's V4 default physical table names inside the bound schema.
-TGT = f"{target_catalog}.{target_schema}"
-T_SPANS = f"{TGT}.mlflow_experiment_trace_otel_spans"
-T_LOGS = f"{TGT}.mlflow_experiment_trace_otel_logs"
-T_METRICS = f"{TGT}.mlflow_experiment_trace_otel_metrics"
-
-print("=== Configuration ===")
-print(f"  Source spans:  {source_spans_table}")
-print(f"  Source logs:   {source_logs_table or '(none — empty logs table will be created)'}")
-print(f"  Target schema: {TGT}")
-print(f"  Experiment:    {experiment_name}")
-print(f"  Warehouse:     {sql_warehouse_id}")
+src_catalog, src_schema, src_table = source_spans_table.split(".")
+src_schema_fqn = f"{src_catalog}.{src_schema}"
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 1 — Init MLflow, verify version
+# MAGIC ## Step 1 — Init MLflow
 
 # COMMAND ----------
 
 import os
 import mlflow
-from mlflow.entities import UCSchemaLocation
-from mlflow.tracing import set_experiment_trace_location
+from mlflow.entities.trace_location import UnityCatalog
 
 mlflow.set_tracking_uri("databricks")
 os.environ["MLFLOW_TRACING_SQL_WAREHOUSE_ID"] = sql_warehouse_id
-
-assert mlflow.__version__ >= "3.14", (
-    f"MLflow {mlflow.__version__} too old; need >= 3.14.0. Re-run the %pip cell."
-)
+assert mlflow.__version__ >= "3.14", f"MLflow {mlflow.__version__} too old; need >= 3.14.0."
 print(f"MLflow {mlflow.__version__} ready.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 2 — Capture MLflow's exact target schema (throwaway seed)
-# MAGIC
-# MAGIC Rather than hard-code DDL that could drift across MLflow versions, we let MLflow tell us
-# MAGIC the schema: bind a throwaway experiment to a scratch schema, copy the empty table shapes
-# MAGIC it creates, then drop the scratch. This guarantees the target tables match this
-# MAGIC workspace's MLflow version exactly.
+# MAGIC ## Step 2 — Detect the source schema version and choose a path
 
 # COMMAND ----------
 
-import uuid
-
-seed_schema = f"_bind_seed_{uuid.uuid4().hex[:8]}"
-seed_fqn = f"{target_catalog}.{seed_schema}"
-seed_exp_name = f"{experiment_name}__seed_{uuid.uuid4().hex[:6]}"
-
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {seed_fqn}")
-_seed_exp = mlflow.set_experiment(experiment_name=seed_exp_name)
-set_experiment_trace_location(
-    location=UCSchemaLocation(catalog_name=target_catalog, schema_name=seed_schema),
-    experiment_id=_seed_exp.experiment_id,
-    sql_warehouse_id=sql_warehouse_id,
-)
-
-# Build the target tables as empty copies of the seed's physical tables, then stamp v1.
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TGT}")
-for tgt, name in [
-    (T_SPANS, "mlflow_experiment_trace_otel_spans"),
-    (T_LOGS, "mlflow_experiment_trace_otel_logs"),
-    (T_METRICS, "mlflow_experiment_trace_otel_metrics"),
-]:
-    spark.sql(f"CREATE OR REPLACE TABLE {tgt} AS SELECT * FROM {seed_fqn}.{name} WHERE 1=0")
-    spark.sql(f"ALTER TABLE {tgt} SET TBLPROPERTIES ('otel.schemaVersion' = 'v1')")
-
-# Record the exact target spans column order for the reshape INSERT.
-target_span_cols = [r.col_name for r in spark.sql(f"DESCRIBE TABLE {T_SPANS}").collect()
-                    if r.col_name and not r.col_name.startswith("#")]
-print("Target spans columns:", target_span_cols)
-
-# Drop the scratch seed (do NOT drop the target).
-spark.sql(f"DROP SCHEMA IF EXISTS {seed_fqn} CASCADE")
-try:
-    _e = mlflow.get_experiment_by_name(seed_exp_name)
-    if _e:
-        mlflow.delete_experiment(_e.experiment_id)
-except Exception as e:
-    print(f"(seed experiment cleanup warning: {e})")
-print("Empty target tables created + stamped otel.schemaVersion=v1; seed dropped.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 3 — Reshape the source into the OTel span schema
-# MAGIC
-# MAGIC The tricky part is `attributes` (and the nested `attributes` inside `resource` and
-# MAGIC `instrumentation_scope`): the target wants `MAP<STRING,STRING>`. We detect the source
-# MAGIC column type and convert accordingly — VARIANT or JSON-STRING → MAP, existing MAP as-is.
-# MAGIC
-# MAGIC **`events` and `links` default to empty arrays** (see the design note at the bottom):
-# MAGIC reconstructing them from an arbitrary source is source-specific. If your spans carry
-# MAGIC events/links you need to preserve, edit the two marked expressions.
-
-# COMMAND ----------
-
-# Inspect source columns + types.
-src_desc = {r.col_name: r.data_type for r in spark.sql(f"DESCRIBE TABLE {source_spans_table}").collect()
-            if r.col_name and not r.col_name.startswith("#")}
-src_cols = set(src_desc)
+def _tblprop(fqn, key):
+    try:
+        rows = spark.sql(f"SHOW TBLPROPERTIES {fqn} ('{key}')").collect()
+        return rows[0].value if rows else None
+    except Exception:
+        return None
 
 
-def col_or(name, default_sql):
-    """Reference source column if present, else a default literal."""
-    return f"s.{name}" if name in src_cols else default_sql
+def _exists(fqn):
+    try:
+        spark.sql(f"DESCRIBE TABLE {fqn}").collect()
+        return True
+    except Exception:
+        return False
 
 
-def to_map(expr, coltype):
-    """Convert a source attributes-like column to MAP<STRING,STRING>."""
-    if coltype and coltype.lower().startswith("map"):
-        return expr                              # already a MAP
-    # VARIANT or STRING(JSON): CAST to STRING yields JSON text, then parse to MAP.
-    return f"from_json(CAST({expr} AS STRING), 'MAP<STRING,STRING>')"
+def _describe_cols(fqn):
+    """[(name, type_str)] via DESCRIBE — avoids Spark Connect's inability to resolve VARIANT in
+    .schema/.columns/.dtypes, and stops at the first metadata/clustering boundary so CLUSTER BY
+    columns aren't counted twice."""
+    out = []
+    for r in spark.sql(f"DESCRIBE TABLE {fqn}").collect():
+        c = r.col_name
+        if not c or c.startswith("#"):
+            break
+        out.append((c, (r.data_type or "")))
+    return out
 
 
-attrs_type = src_desc.get("attributes", "")
-# Nested attribute columns may be typed as struct fields; we CAST-then-parse defensively.
-EMPTY_EVENTS = ("CAST(array() AS ARRAY<STRUCT<time_unix_nano:BIGINT,name:STRING,"
-                "attributes:MAP<STRING,STRING>,dropped_attributes_count:INT>>)")
-EMPTY_LINKS = ("CAST(array() AS ARRAY<STRUCT<trace_id:STRING,span_id:STRING,trace_state:STRING,"
-               "attributes:MAP<STRING,STRING>,dropped_attributes_count:INT,flags:INT>>)")
+src_types = dict(_describe_cols(source_spans_table))
+src_cols = set(src_types)
+attrs_type = (src_types.get("attributes", "") or "").lower()
+schema_version = _tblprop(source_spans_table, "otel.schemaVersion")
 
-# One SELECT expression per target column, in the exact target order.
-expr = {
-    "trace_id": col_or("trace_id", "CAST(NULL AS STRING)"),
-    "span_id": col_or("span_id", "CAST(NULL AS STRING)"),
-    "trace_state": col_or("trace_state", "''"),
-    "parent_span_id": col_or("parent_span_id", "CAST(NULL AS STRING)"),
-    "flags": col_or("flags", "0"),
-    "name": col_or("name", "''"),
-    "kind": col_or("kind", "'SPAN_KIND_INTERNAL'"),
-    "start_time_unix_nano": col_or("start_time_unix_nano", "0"),
-    "end_time_unix_nano": col_or("end_time_unix_nano", "0"),
-    "attributes": to_map("s.attributes", attrs_type) if "attributes" in src_cols else "map()",
-    "dropped_attributes_count": col_or("dropped_attributes_count", "0"),
-    "events": EMPTY_EVENTS,   # <-- EDIT if your source has events to preserve
-    "dropped_events_count": col_or("dropped_events_count", "0"),
-    "links": EMPTY_LINKS,     # <-- EDIT if your source has links to preserve
-    "dropped_links_count": col_or("dropped_links_count", "0"),
-    "status": ("named_struct('message', s.status.message, 'code', s.status.code)"
-               if "status" in src_cols else
-               "named_struct('message', CAST(NULL AS STRING), 'code', 'STATUS_CODE_UNSET')"),
-    "resource": ("named_struct('attributes', "
-                 + to_map("s.resource.attributes", "") +
-                 ", 'dropped_attributes_count', s.resource.dropped_attributes_count)"
-                 if "resource" in src_cols else
-                 "named_struct('attributes', map(), 'dropped_attributes_count', 0)"),
-    "resource_schema_url": col_or("resource_schema_url", "''"),
-    "instrumentation_scope": (
-        "named_struct('name', s.instrumentation_scope.name, 'version', s.instrumentation_scope.version, "
-        "'attributes', " + to_map("s.instrumentation_scope.attributes", "") +
-        ", 'dropped_attributes_count', s.instrumentation_scope.dropped_attributes_count)"
-        if "instrumentation_scope" in src_cols else
-        "named_struct('name', '', 'version', '', 'attributes', map(), 'dropped_attributes_count', 0)"),
-    "span_schema_url": col_or("span_schema_url", "''"),
-}
+is_variant = attrs_type.startswith("variant")
+is_map = attrs_type.startswith("map")
+has_v2_cols = {"record_id", "time", "date", "service_name"} <= src_cols
+named_spans = src_table.endswith("_otel_spans")
+src_prefix = src_table[: -len("_otel_spans")] if named_spans else None
 
-missing = [c for c in target_span_cols if c not in expr]
-if missing:
-    _fail(f"Target has columns this notebook doesn't map: {missing}. "
-          "Your MLflow version's schema differs — add expressions for these in Step 3.")
+# Path A: a conformant, in-place-adoptable v2 table set
+path = None
+if named_spans and (schema_version == "v2" or (is_variant and has_v2_cols)):
+    sib = [f"{src_schema_fqn}.{src_prefix}_otel_{s}" for s in ("logs", "metrics")]
+    if all(_exists(s) for s in sib):
+        path = "A"
+# Path B: standard v1 schema-linked table set (what V1ToV2SqlMigration expects by name)
+if path is None and src_table == "mlflow_experiment_trace_otel_spans" \
+        and _exists(f"{src_schema_fqn}.mlflow_experiment_trace_otel_logs"):
+    path = "B"
+# Path C: everything else
+if path is None:
+    path = "C"
 
-select_sql = ",\n  ".join(f"{expr[c]} AS {c}" for c in target_span_cols)
-reshape_sql = (
-    f"INSERT OVERWRITE {T_SPANS}\n"
-    f"SELECT\n  {select_sql}\nFROM {source_spans_table} s"
-)
-print(reshape_sql)
+if path != "A":
+    for v, lbl in [(target_catalog, "Target catalog"), (target_schema, "Target schema"),
+                   (target_prefix, "Target table prefix")]:
+        if not _ID.match(v):
+            _fail(f"{lbl} must be a bare identifier (required for convert paths B/C)")
 
-# COMMAND ----------
-
-# DBTITLE 1,Warn if events/links would be dropped
-for arr_col in ("events", "links"):
-    if arr_col in src_cols:
-        try:
-            n = spark.sql(
-                f"SELECT count(*) c FROM {source_spans_table} "
-                f"WHERE {arr_col} IS NOT NULL AND size(CAST({arr_col} AS ARRAY<STRING>)) > 0"
-            ).first().c
-        except Exception:
-            n = None
-        if n:
-            print(f"WARNING: {n} source rows have non-empty '{arr_col}'. These are dropped "
-                  f"unless you edit the '{arr_col}' expression in Step 3.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Execute the reshape
-spark.sql(reshape_sql)
-n_spans = spark.sql(f"SELECT count(*) c FROM {T_SPANS}").first().c
-print(f"Reshaped {n_spans} spans into {T_SPANS}.")
-
-# Optional: reshape logs the same way is left as an exercise; empty logs is fine for the UI.
-if source_logs_table:
-    print(f"(Source logs table given: {source_logs_table}. This template leaves logs empty — "
-          "add a logs reshape mirroring Step 3 if you need them.)")
+print(f"source otel.schemaVersion={schema_version!r} attributes={attrs_type!r} "
+      f"has_v2_cols={has_v2_cols} named_spans={named_spans}")
+print({"A": "PATH A — adopt the conformant v2 source in place (no copy)",
+       "B": "PATH B — official V1ToV2SqlMigration (standard v1 -> v2)",
+       "C": "PATH C — generic reshape into a fresh v2 table"}[path])
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 4 — Create the experiment and bind (adopt the tables)
+# MAGIC ## Step 3 — Create the experiment and the v2 destination
+# MAGIC
+# MAGIC All paths bind through the creation-time API, which creates the empty `{prefix}_otel_*` v2
+# MAGIC tables (for B/C) or adopts the existing ones (A), and builds the `_trace_metadata` /
+# MAGIC `_trace_unified` views.
 
 # COMMAND ----------
 
-existing = mlflow.get_experiment_by_name(experiment_name)
-if existing is not None:
-    experiment_id = existing.experiment_id
-    already_bound = any(
-        k.startswith("mlflow.experiment.databricksTrace") for k in (existing.tags or {})
-    )
-    print(f"Experiment exists ({experiment_id}); trace location "
-          f"{'already bound — data refreshed in place' if already_bound else 'not bound — binding now'}.")
-    if not already_bound:
-        set_experiment_trace_location(
-            location=UCSchemaLocation(catalog_name=target_catalog, schema_name=target_schema),
-            experiment_id=experiment_id,
-            sql_warehouse_id=sql_warehouse_id,
-        )
+if path == "A":
+    bind_catalog, bind_schema, bind_prefix = src_catalog, src_schema, src_prefix
 else:
-    experiment_id = mlflow.set_experiment(experiment_name=experiment_name).experiment_id
-    set_experiment_trace_location(
-        location=UCSchemaLocation(catalog_name=target_catalog, schema_name=target_schema),
-        experiment_id=experiment_id,
-        sql_warehouse_id=sql_warehouse_id,
-    )
-    print(f"Created + bound experiment {experiment_id}.")
+    bind_catalog, bind_schema, bind_prefix = target_catalog, target_schema, target_prefix
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {bind_catalog}.{bind_schema}")
+
+experiment = mlflow.set_experiment(
+    experiment_name=experiment_name,
+    trace_location=UnityCatalog(catalog_name=bind_catalog, schema_name=bind_schema,
+                                table_prefix=bind_prefix),
+)
+experiment_id = experiment.experiment_id
+spans_fqn = experiment.trace_location.full_otel_spans_table_name
+print(f"Experiment {experiment_id} bound to {spans_fqn} "
+      f"(otel.schemaVersion={_tblprop(spans_fqn, 'otel.schemaVersion')})")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 4 — Populate the v2 destination (B and C only)
+
+# COMMAND ----------
+
+if path == "B":
+    # Official helper: MAP->VARIANT spans + log-events->annotations. Names are inferred as
+    # {schema}.mlflow_experiment_trace_otel_{spans,logs}, which this source matches.
+    from databricks.migrations.v1_to_v2 import V1ToV2SqlMigration
+    V1ToV2SqlMigration(
+        v1_source_schema=src_schema_fqn,
+        v2_destination_prefix=f"{bind_catalog}.{bind_schema}.{bind_prefix}",
+    ).run()
+    print("V1ToV2SqlMigration complete.")
+
+elif path == "C":
+    # Generic reshape of an arbitrary source into the v2 span schema MLflow just created.
+    def col_or(name, default_sql):
+        return f"s.{name}" if name in src_cols else default_sql
+
+    def to_variant(expr, coltype):
+        # JSON-string -> parse directly; MAP/STRUCT/VARIANT -> round-trip via to_json
+        return f"parse_json({expr})" if (coltype or "").lower().startswith("string") \
+            else f"parse_json(to_json({expr}))"
+
+    def nested_is_string(container_type):
+        return bool(re.search(r"attributes:\s*string", (container_type or "").lower()))
+
+    time_expr = ("timestamp_micros(CAST(s.start_time_unix_nano/1000 AS BIGINT))"
+                 if "start_time_unix_nano" in src_cols else "current_timestamp()")
+    svc_expr = ("COALESCE(element_at(s.resource.attributes,'service.name'),'')"
+                if ("resource" in src_cols and "map" in (src_types.get("resource", "")).lower())
+                else "''")
+    attrs_expr = to_variant("s.attributes", attrs_type) if "attributes" in src_cols else "parse_json('{}')"
+
+    res_t = src_types.get("resource", "")
+    resource_expr = ("named_struct('attributes', "
+                     + to_variant("s.resource.attributes", "string" if nested_is_string(res_t) else "map")
+                     + ", 'dropped_attributes_count', s.resource.dropped_attributes_count)"
+                     if "resource" in src_cols else
+                     "named_struct('attributes', parse_json('{}'), 'dropped_attributes_count', 0)")
+
+    is_t = src_types.get("instrumentation_scope", "")
+    iscope_expr = ("named_struct('name', s.instrumentation_scope.name, 'version', "
+                   "s.instrumentation_scope.version, 'attributes', "
+                   + to_variant("s.instrumentation_scope.attributes", "string" if nested_is_string(is_t) else "map")
+                   + ", 'dropped_attributes_count', s.instrumentation_scope.dropped_attributes_count)"
+                   if "instrumentation_scope" in src_cols else
+                   "named_struct('name','','version','','attributes',parse_json('{}'),'dropped_attributes_count',0)")
+
+    EMPTY_EVENTS = ("CAST(array() AS ARRAY<STRUCT<time_unix_nano:BIGINT,name:STRING,"
+                    "attributes:VARIANT,dropped_attributes_count:INT>>)")
+    EMPTY_LINKS = ("CAST(array() AS ARRAY<STRUCT<trace_id:STRING,span_id:STRING,trace_state:STRING,"
+                   "attributes:VARIANT,dropped_attributes_count:INT,flags:INT>>)")
+    if "events" in src_cols and "array" in (src_types.get("events", "")).lower():
+        n = "string" if nested_is_string(src_types["events"]) else "map"
+        events_expr = ("transform(s.events, e -> named_struct('time_unix_nano', e.time_unix_nano, "
+                       "'name', e.name, 'attributes', " + to_variant("e.attributes", n)
+                       + ", 'dropped_attributes_count', e.dropped_attributes_count))")
+    else:
+        events_expr = EMPTY_EVENTS
+    if "links" in src_cols and "array" in (src_types.get("links", "")).lower():
+        n = "string" if nested_is_string(src_types["links"]) else "map"
+        links_expr = ("transform(s.links, l -> named_struct('trace_id', l.trace_id, 'span_id', l.span_id, "
+                      "'trace_state', l.trace_state, 'attributes', " + to_variant("l.attributes", n)
+                      + ", 'dropped_attributes_count', l.dropped_attributes_count, 'flags', l.flags))")
+    else:
+        links_expr = EMPTY_LINKS
+
+    status_expr = ("named_struct('message', s.status.message, 'code', s.status.code)"
+                   if "status" in src_cols else
+                   "named_struct('message', CAST(NULL AS STRING), 'code', 'STATUS_CODE_UNSET')")
+
+    expr = {
+        "record_id": "uuid()", "time": time_expr, "date": f"to_date({time_expr})",
+        "service_name": svc_expr,
+        "trace_id": col_or("trace_id", "CAST(NULL AS STRING)"),
+        "span_id": col_or("span_id", "CAST(NULL AS STRING)"),
+        "trace_state": col_or("trace_state", "''"),
+        "parent_span_id": col_or("parent_span_id", "CAST(NULL AS STRING)"),
+        "flags": col_or("flags", "0"), "name": col_or("name", "''"),
+        "kind": col_or("kind", "'SPAN_KIND_INTERNAL'"),
+        "start_time_unix_nano": col_or("start_time_unix_nano", "0"),
+        "end_time_unix_nano": col_or("end_time_unix_nano", "0"),
+        "attributes": attrs_expr, "dropped_attributes_count": col_or("dropped_attributes_count", "0"),
+        "events": events_expr, "dropped_events_count": col_or("dropped_events_count", "0"),
+        "links": links_expr, "dropped_links_count": col_or("dropped_links_count", "0"),
+        "status": status_expr, "resource": resource_expr,
+        "resource_schema_url": col_or("resource_schema_url", "''"),
+        "instrumentation_scope": iscope_expr, "span_schema_url": col_or("span_schema_url", "''"),
+    }
+    # target column order from the table MLflow created (DESCRIBE-based: VARIANT-safe on Connect)
+    target_cols = [c for c, _ in _describe_cols(spans_fqn)]
+    missing = [c for c in target_cols if c not in expr]
+    if missing:
+        _fail(f"v2 schema has columns this notebook doesn't map: {missing}")
+    select_sql = ",\n  ".join(f"{expr[c]} AS {c}" for c in target_cols)
+    reshape_sql = f"INSERT OVERWRITE {spans_fqn}\nSELECT\n  {select_sql}\nFROM {source_spans_table} s"
+    print(reshape_sql)
+    spark.sql(reshape_sql)
+    _n = spark.sql(f"SELECT count(*) c FROM {spans_fqn}").first().c
+    print(f"Reshaped {_n} spans into {spans_fqn} (v2 / VARIANT).")
 
 # COMMAND ----------
 
@@ -324,19 +304,15 @@ else:
 
 # COMMAND ----------
 
-# The _unified view is what the Traces UI reads; querying it confirms traces assemble.
-unified = f"{TGT}.mlflow_experiment_trace_unified"
-n_unified = spark.sql(f"SELECT count(*) c FROM {unified}").first().c
-print(f"{unified}: {n_unified} traces assembled.")
+unified = f"{bind_catalog}.{bind_schema}.{bind_prefix}_trace_unified"
+print(f"{unified}: {spark.sql(f'SELECT count(*) c FROM {unified}').first().c} traces assembled.")
 display(spark.sql(f"SELECT trace_id, request, response FROM {unified} LIMIT 5"))
 
-# search_traces works with in-workspace user creds.
 try:
     df = mlflow.search_traces(experiment_ids=[experiment_id], max_results=10)
     print(f"mlflow.search_traces returned {len(df)} traces.")
 except Exception as e:
-    print(f"search_traces note: {e}\n(If this 401s from a local/CLI token, run in-workspace or "
-          "verify via the _unified view above and the Traces UI.)")
+    print(f"search_traces note: {e}")
 
 host = spark.conf.get("spark.databricks.workspaceUrl", "")
 if host:
@@ -345,19 +321,14 @@ if host:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Design notes & caveats
-# MAGIC
-# MAGIC - **This is a copy, not a live view.** MLflow requires it to own the physical tables, so
-# MAGIC   the traces are duplicated into the target. Re-run this notebook (Step 3 uses
-# MAGIC   `INSERT OVERWRITE`) to refresh; or schedule it. You cannot bind an experiment to a
-# MAGIC   plain view/MV over your source.
-# MAGIC - **Binding is permanent.** An experiment's trace location is fixed once set; to change
-# MAGIC   it, use `mlflow.tracing.unset_experiment_trace_location(...)` first, or use a new
-# MAGIC   experiment name.
-# MAGIC - **events / links** are dropped to empty arrays by default. To preserve them, edit the
-# MAGIC   two marked expressions in Step 3 (each nested `attributes` must become `MAP<STRING,STRING>`).
-# MAGIC - **Schema drift.** Step 2 reads the schema from your MLflow version at runtime, so the
-# MAGIC   target always matches. If MLflow adds/renames columns, Step 3 will flag unmapped ones.
-# MAGIC - **Do not pre-create** `mlflow_experiment_trace_metadata` or `..._unified` — MLflow
-# MAGIC   builds those as views during binding; pre-creating them as tables breaks it.
-# MAGIC - See `SCHEMA_REFERENCE.md` for the full target schema and the reshape mapping.
+# MAGIC ## Notes
+# MAGIC - **Destination is always v2** (VARIANT). Path A adopts in place (no copy); B/C write a v2
+# MAGIC   physical table (re-run to refresh — B's migrator and C's `INSERT OVERWRITE` are idempotent).
+# MAGIC - **A standard v1 table under a non-standard name** can still use the official migrator by
+# MAGIC   aliasing it to `mlflow_experiment_trace_otel_spans`/`_otel_logs` via views in a scratch
+# MAGIC   schema and pointing Path B at that schema; otherwise it falls to Path C (spans only, no
+# MAGIC   annotations).
+# MAGIC - **request/response** populate when span attributes use a recognized key
+# MAGIC   (`mlflow.spanInputs/spanOutputs`, OpenInference `input.value`/`output.value`, OTel
+# MAGIC   `gen_ai.*`, `gcp.vertex.*`); otherwise alias custom keys in Step 4's reshape.
+# MAGIC - **Materialized views cannot be a v2 destination** — the adoption API rejects them.
