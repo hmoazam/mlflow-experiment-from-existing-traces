@@ -15,7 +15,7 @@ per span, with `trace_id` / `span_id` / `attributes`) and live in **UC**.
 
 ## The two schema versions
 
-Databricks defines exactly two UC trace-table schema versions (there is no v3; this is unrelated to
+Databricks defines exactly two UC trace-table schema versions (note this is unrelated to
 OpenTelemetry's own `schema_url` semantic-convention versioning, which lives in the `*_schema_url`
 columns):
 
