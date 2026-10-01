@@ -1,135 +1,110 @@
-# Point an MLflow experiment at an existing trace table
+# Point an MLflow experiment at an existing OTel trace table
 
-Make OTel span data that **already exists in Unity Catalog** show up in an **MLflow experiment**
-— the Traces UI, `mlflow.search_traces`, and MLflow GenAI evaluation — without regenerating it
-from an instrumented app.
+Make OTel span data that **already exists in a Unity Catalog Delta table** show up in an **MLflow
+experiment** — the Traces UI, `mlflow.search_traces`, and MLflow GenAI evaluation — without
+regenerating it from an instrumented app. The table MLflow ends up bound to is always the current
+**`otel.schemaVersion = v2`** schema.
 
-Works for any UC span table: MLflow-created "raw" traces, the redacted output of a PII pipeline
-(e.g. [otel-pii-redaction](https://github.com/hmoazam/otel-pii-redaction)), or traces an
-external / non-Databricks app exported into UC.
+Works for any UC span table: MLflow-created traces, Zerobus OTLP ingestion output, the redacted
+output of a PII pipeline, or traces an external / non-Databricks app exported into UC.
 
 **Scope.** This repo starts from the point where **OTel span data already exists in a Unity
-Catalog Delta table**. Getting it there — instrumenting an app, OTLP ingest, an ETL job, or a
-redaction pipeline — is upstream and **out of scope**; those are named only as example origins.
-The source must be **span-shaped** (one row per span, with `trace_id` / `span_id` / `attributes`)
-and live in **UC** — a UC Delta table is the only thing MLflow's trace backend can adopt.
+Catalog Delta table**. Getting it there — instrumenting an app, OTLP/Zerobus ingest, an ETL job, a
+redaction pipeline — is upstream and **out of scope**. The source must be **span-shaped** (one row
+per span, with `trace_id` / `span_id` / `attributes`) and live in **UC**.
 
-## The catch (and the fix)
+## The two schema versions
 
-You **cannot** just name an existing table as an experiment's trace location. MLflow's backend
-only accepts tables it recognizes as its own: it checks a Delta table property,
-`otel.schemaVersion`, and rejects anything else with
+Databricks defines exactly two UC trace-table schema versions (there is no v3; this is unrelated to
+OpenTelemetry's own `schema_url` semantic-convention versioning, which lives in the `*_schema_url`
+columns):
 
-```
-ALREADY_EXISTS: ... already exists with incompatible schema version: expected v1, got UNSPECIFIED
-```
+| | **v1** (legacy) | **v2** (current, recommended) |
+|---|---|---|
+| Trace location | 2-part `catalog.schema` | 3-part `catalog.schema.table_prefix` |
+| Table names | fixed `mlflow_experiment_trace_otel_*` | `{prefix}_otel_*` |
+| `attributes` | `MAP<STRING,STRING>` | `VARIANT` |
+| Annotations | tags/assessments as log events | dedicated `_otel_annotations` table |
 
-The working recipe, validated end-to-end:
+This repo always targets **v2**. Zerobus OTLP ingestion already stamps `otel.schemaVersion=v2`; if a
+table has no such property, the notebook infers the version from its shape.
 
-1. **Reshape** the source into MLflow's exact OTel span schema — notably `attributes` as
-   `MAP<STRING,STRING>` and the precise column names/order (see [`SCHEMA_REFERENCE.md`](SCHEMA_REFERENCE.md)).
-2. **Stamp** the property: `ALTER TABLE ... SET TBLPROPERTIES ('otel.schemaVersion' = 'v1')`.
-3. **Bind** with `mlflow.tracing.set_experiment_trace_location(...)`. MLflow *adopts* your
-   tables and builds its own `_metadata` / `_unified` views on top.
+## How binding works (and why v2)
 
-> **Two MLflow trace APIs exist — use the right one.**
-> `set_experiment(trace_location=UnityCatalog(...))` (creation-time) does **not** adopt
-> pre-existing tables, even stamped (server-side "Telemetry profile not found").
-> `mlflow.tracing.set_experiment_trace_location(...)` **does**. This repo uses the latter.
+You **cannot** point an experiment at a pre-existing table just by naming it — MLflow's backend
+only accepts tables it recognizes. Two APIs matter:
+
+- **`mlflow.set_experiment(experiment_name=..., trace_location=UnityCatalog(cat, schema, prefix))`**
+  — the current (v2) path. It **adopts** a pre-existing, conformant `{prefix}_otel_*` **v2** table
+  set in place and builds the `_trace_metadata` / `_trace_unified` views on top. For a non-existent
+  destination it creates the empty v2 tables.
+- `mlflow.tracing.set_experiment_trace_location(...)` — the older **v1** (MAP) path. This repo no
+  longer uses it.
+
+> **No materialized view for the destination.** The v2 adoption API validates that the spans object
+> is a physical table and **rejects a materialized view** (`Failed to validate table
+> compatibility`). So the convert paths below always land in a physical table; only an *already-v2
+> table set* is adopted without a copy.
+
+## What the notebook does
+
+[`bind_experiment_to_existing_traces.py`](bind_experiment_to_existing_traces.py) auto-detects the
+source and routes to one of three paths — all ending on a v2 table:
+
+| Detected source | Path | How it reaches v2 |
+|---|---|---|
+| **Conformant v2** — `otel.schemaVersion=v2` (or VARIANT attrs + `record_id/time/date/service_name`), named `{p}_otel_spans`, with sibling `_otel_logs`/`_otel_metrics` | **A — adopt in place** | `set_experiment(trace_location=UnityCatalog(...))` on the source schema. No copy. |
+| **Standard v1** — `mlflow_experiment_trace_otel_spans` + `_otel_logs` | **B — official migrator** | Create a v2 destination, then `databricks.migrations.v1_to_v2.V1ToV2SqlMigration(...).run()` (MAP→VARIANT spans + log-events→annotations). |
+| **Anything else** — renamed v1, external exports, non-standard layouts | **C — generic reshape** | Reshape the source into the v2 span schema (MAP/JSON/VARIANT → VARIANT, synthesize `record_id/time/date/service_name`), `INSERT OVERWRITE` a fresh v2 table, adopt it. |
 
 ## Quick start
 
-1. Open [`bind_experiment_to_existing_traces.py`](bind_experiment_to_existing_traces.py) as a
-   notebook in your Databricks workspace (import the repo into a Git folder).
-2. Fill the widgets:
-   - **Source spans table** — `catalog.schema.table` of your existing spans
-   - **Target catalog / schema** — where MLflow's adopted tables will live (created if absent)
-   - **Experiment name** — e.g. `/Users/you/existing-traces`
-   - **SQL warehouse ID** — a serverless warehouse
-3. **Run All.** It reshapes → stamps → binds → verifies, and prints the Traces UI link.
+1. Import the repo into a Databricks Git folder and open the notebook.
+2. Fill the widgets: **source spans table**, **target catalog/schema/prefix** (for paths B/C),
+   **experiment name**, **serverless SQL warehouse ID**.
+3. **Run All** — it detects the version, reaches v2, binds, verifies, and prints the Traces UI link.
 
-Run it **in the workspace** (in-workspace user creds). A local/CLI token can hit a 401 on the
-trace-read API — see caveats.
-
-## How it works
-
-```
-existing spans table                MLflow-owned, adopted tables (target schema)
-┌─────────────────────────┐        ┌────────────────────────────────────────────┐
-│ your_catalog.your_schema│        │ mlflow_experiment_trace_otel_spans   (table) │
-│   .your_otel_spans       │        │ mlflow_experiment_trace_otel_logs    (table) │
-│  (VARIANT/JSON attrs,    │─reshape│ mlflow_experiment_trace_otel_metrics (table) │
-│   any column layout)     │  +stamp│ mlflow_experiment_trace_metadata     (view)  │  ← MLflow builds
-│                          │  +bind │ mlflow_experiment_trace_unified      (view)  │  ← MLflow builds
-└─────────────────────────┘        └────────────────────────────────────────────┘
-                                          ▲ experiment bound here (V4 API)
-```
+Run it **in the workspace** (in-workspace creds).
 
 ## Adopting external / non-MLflow traces
 
-The reshape (Step 3) adapts **any column layout** — missing columns are defaulted and
-`attributes` is coerced to `MAP<STRING,STRING>` whether the source stored it as VARIANT, a JSON
-string, or an existing map. So a span table exported into UC by a non-MLflow app binds and lists
-fine, regardless of its schema.
+The reshape (Path C) adapts any column layout. Whether **request/response** render in the Traces UI
+depends on the span's attribute keys, which MLflow's `_unified` view derives by `COALESCE`-ing over
+recognized conventions:
 
-Whether the **request / response** columns populate in the Traces UI depends on the span's
-**attribute keys**, not on how the table was produced. MLflow's `_unified` view derives them by
-`COALESCE`-ing over a fixed set of recognized conventions:
-
-| Column | Recognized attribute keys (first non-null wins) |
+| Column | Recognized keys (first non-null wins) |
 |---|---|
 | `request`  | `mlflow.spanInputs` · `input.value` (OpenInference) · `gen_ai.input.messages` · `gen_ai.tool.call.arguments` · `gcp.vertex.agent.llm_request` |
 | `response` | `mlflow.spanOutputs` · `output.value` · `gen_ai.output.messages` · `gen_ai.tool.call.result` · `gcp.vertex.agent.llm_response` · `gcp.vertex.agent.tool_response` |
 
-If your source uses one of these (MLflow, OpenInference, OTel-GenAI, Vertex), request/response
-render with no extra work — validated against an external OpenInference-convention table. If it
-uses **custom keys** (e.g. `prompt_text` / `reply_text`), the spans still appear but
-request/response come up empty; alias the custom key to a recognized one in the Step 3 reshape,
-e.g.:
+MLflow, OpenInference, OTel-GenAI, and Vertex sources render with no extra work. For **custom
+keys**, alias them to a recognized key in the Path C reshape; spans always render regardless.
 
-```sql
--- surface custom keys under names MLflow recognizes (later keys win in map_concat)
-map_concat(
-  from_json(CAST(s.attributes AS STRING), 'MAP<STRING,STRING>'),
-  map('mlflow.spanInputs',  get_json_object(CAST(s.attributes AS STRING), '$.prompt_text'),
-      'mlflow.spanOutputs', get_json_object(CAST(s.attributes AS STRING), '$.reply_text'))
-) AS attributes
-```
+## Notes & caveats
+
+- **A standard v1 table under a non-standard name** can still use the official migrator (which
+  infers `mlflow_experiment_trace_otel_*` names) by aliasing it via views in a scratch schema and
+  pointing Path B there; otherwise it falls to Path C (spans only — tags/assessments aren't carried
+  into annotations).
+- **Destination is always v2 / VARIANT.** Path A adopts in place (no copy); B/C write a v2 physical
+  table and are idempotent (re-run / schedule to refresh).
+- **events / links** are preserved when the source carries them (nested attrs → VARIANT), else
+  defaulted to empty arrays.
+- **Requires** `mlflow[databricks] >= 3.14.0`, `databricks-agents >= 1.10.1` (Path B), and a
+  serverless SQL warehouse. `search_traces` from a local/CLI token can 401 on the trace-read API —
+  run in-workspace or verify via the `_unified` view (the notebook does both).
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `bind_experiment_to_existing_traces.py` | Guided Databricks notebook — reshape, stamp, bind, verify |
-| `SCHEMA_REFERENCE.md` | The exact target OTel span schema + reshape mapping (incl. events/links) |
+| `bind_experiment_to_existing_traces.py` | Guided notebook — detect version, reach v2, bind, verify |
+| `SCHEMA_REFERENCE.md` | The v1 and v2 OTel span schemas + the reshape/migration mapping |
 | `README.md` | This file |
-
-## Caveats
-
-- **The default is a physical copy.** The notebook copies the reshaped spans into the target via
-  `INSERT OVERWRITE` (re-run or schedule it as the source grows). This is the recommended path —
-  the experiment stays writable and is decoupled from the source's lifecycle.
-  - A **materialized view** named `mlflow_experiment_trace_otel_spans` **can** be adopted instead
-    (no data copy), but **read-only**: stamp `otel.schemaVersion=v1` *inline* in
-    `CREATE … TBLPROPERTIES(…) AS` (an MV rejects `ALTER … SET TBLPROPERTIES`), and any new traces
-    logged to the bound experiment are **silently dropped** (MLflow can't write to an MV). You
-    also own `REFRESH`. Use only for read-only adoption of existing traces.
-  - A **plain view** does **not** work — it can't carry the `otel.schemaVersion` table property,
-    so MLflow won't adopt it.
-- **Binding is permanent** per experiment (unset with
-  `mlflow.tracing.unset_experiment_trace_location(...)`, or use a new experiment name).
-- **events / links** default to empty arrays; preserving them needs a per-source
-  reconstruction — see `SCHEMA_REFERENCE.md`.
-- **`search_traces` 401 from a local/CLI token** is a client-auth quirk of the trace-read API,
-  not a data problem. Run in-workspace, or verify via the `_unified` view (the notebook does
-  both).
-- Requires `mlflow[databricks] >= 3.14.0` (the V4 trace-location API) and a serverless SQL
-  warehouse.
 
 ## Provenance
 
-Recipe validated end-to-end in a Databricks workspace against MLflow-generated, PII-redacted, and
-external (non-MLflow, OpenInference-convention) UC span tables, and with both a physical-table
-copy and a read-only materialized view. The critical unlock — `otel.schemaVersion` is a settable
-Delta table property — is what turns "you can't point an experiment at existing tables" into the
-flow above.
+Validated end-to-end in a Databricks workspace: v2 adopt-in-place, official `V1ToV2SqlMigration`
+(standard v1 and view-aliased renamed v1), and the generic reshape — against MLflow-created,
+PII-redacted, and external (OpenInference-convention) sources. The adoption API's rejection of
+materialized views for a v2 destination is likewise tested, not assumed.
